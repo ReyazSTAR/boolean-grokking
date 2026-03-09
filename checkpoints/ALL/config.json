@@ -1,0 +1,17 @@
+{
+  "d_model": 64,
+  "n_heads": 2,
+  "n_layers": 1,
+  "d_mlp": 256,
+  "use_mlp": true,
+  "lr": 0.001,
+  "weight_decay": 1.0,
+  "n_epochs": 5000,
+  "batch_size": 64,
+  "train_frac": 0.7,
+  "op_name": "ALL",
+  "n_copies": 1000,
+  "save_dir": "checkpoints",
+  "checkpoint_every": 100,
+  "log_every": 10
+}
