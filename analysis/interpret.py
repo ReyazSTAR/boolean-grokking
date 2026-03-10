@@ -2,42 +2,60 @@
 Mechanistic Interpretability Analysis for Boolean Grokking
 ==========================================================
 
-This is where the research happens. After training, load a model and run these
-analyses to reverse-engineer what circuit it learned.
-
 Key analyses:
   1. Loss curves & grokking visualization
   2. Attention pattern heatmaps
   3. Embedding space visualization (PCA)
   4. Logit lens (what does each layer "think" the answer is?)
   5. Ablation studies (zero out heads/MLP to find load-bearing components)
-  6. Weight matrix analysis (what structure is in W_E, W_Q, W_K, W_V?)
+  6. Weight matrix analysis
+  7. HTML report (all plots + all numbers in one file)
+
+Usage:
+  python -m analysis.interpret --op XOR --wd 1.0
+  python -m analysis.interpret --op ALL --wd 0.0
 """
 
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from matplotlib.colors import TwoSlopeNorm
 from pathlib import Path
 import json
-from typing import Optional, List, Dict
+import base64
+from typing import Optional
 
 from models.transformer import BooleanTransformer, TransformerConfig
 from data.dataset import (
     VOCAB_SIZE, SEQ_LEN, TOKEN_NAMES,
     FALSE_TOKEN, TRUE_TOKEN, EQ_TOKEN,
-    OPERATIONS, decode_sequence, SingleOpDataset, AllOpsDataset
+    OPERATIONS, SingleOpDataset, AllOpsDataset
 )
+
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def _tag(op_name: str, wd: float) -> str:
+    """Canonical experiment tag used in all filenames e.g. XOR_wd1.0"""
+    return f"{op_name}_wd{wd}"
+
+
+def _img_to_base64(path: str) -> str:
+    with open(path, 'rb') as f:
+        return base64.b64encode(f.read()).decode('utf-8')
 
 
 # ─────────────────────────────────────────────────────────────────
 # 1. TRAINING DYNAMICS
 # ─────────────────────────────────────────────────────────────────
 
-def plot_training_curves(history: dict, op_name: str, save_path: Optional[str] = None):
+def plot_training_curves(history: dict, op_name: str, wd: float,
+                         save_path: Optional[str] = None):
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle(f'Training Dynamics: {op_name}', fontsize=14, fontweight='bold')
+    tag = _tag(op_name, wd)
+    fig.suptitle(f'Training Dynamics: {tag}', fontsize=14, fontweight='bold')
 
     epochs = history['epoch']
 
@@ -61,7 +79,7 @@ def plot_training_curves(history: dict, op_name: str, save_path: Optional[str] =
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
+        print(f"  Saved: {save_path}")
     plt.close()
 
 
@@ -69,7 +87,7 @@ def plot_training_curves(history: dict, op_name: str, save_path: Optional[str] =
 # 2. ATTENTION PATTERNS
 # ─────────────────────────────────────────────────────────────────
 
-def plot_attention_patterns(model: BooleanTransformer, op_name: str,
+def plot_attention_patterns(model: BooleanTransformer, op_name: str, wd: float,
                              device: str = 'cpu', save_path: Optional[str] = None):
     op_token = OPERATIONS[op_name][0]
     inputs = [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -111,12 +129,13 @@ def plot_attention_patterns(model: BooleanTransformer, op_name: str,
                         ax.text(c, r, f'{attn[r,c]:.2f}', ha='center', va='center',
                                 fontsize=7, color='white' if attn[r,c] > 0.6 else 'black')
 
-    fig.suptitle(f'Attention Patterns: {op_name}', fontsize=13, fontweight='bold')
+    tag = _tag(op_name, wd)
+    fig.suptitle(f'Attention Patterns: {tag}', fontsize=13, fontweight='bold')
     plt.colorbar(im, ax=axes.ravel().tolist(), shrink=0.5)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
+        print(f"  Saved: {save_path}")
     plt.close()
 
 
@@ -124,22 +143,20 @@ def plot_attention_patterns(model: BooleanTransformer, op_name: str,
 # 3. EMBEDDING SPACE
 # ─────────────────────────────────────────────────────────────────
 
-def plot_embedding_space(model: BooleanTransformer, save_path: Optional[str] = None):
+def plot_embedding_space(model: BooleanTransformer, op_name: str, wd: float,
+                         save_path: Optional[str] = None):
     from sklearn.decomposition import PCA
 
     W_E = model.W_E.weight.detach().cpu().numpy()
-
     pca = PCA(n_components=2)
     coords = pca.fit_transform(W_E)
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
     colors = {
-        FALSE_TOKEN: 'steelblue',
-        TRUE_TOKEN: 'crimson',
+        FALSE_TOKEN: 'steelblue', TRUE_TOKEN: 'crimson',
         2: 'forestgreen', 3: 'darkorange', 4: 'purple',
-        5: 'brown', 6: 'pink', 7: 'gray',
-        EQ_TOKEN: 'black',
+        5: 'brown', 6: 'pink', 7: 'gray', EQ_TOKEN: 'black',
     }
 
     for tok_id, name in TOKEN_NAMES.items():
@@ -151,21 +168,31 @@ def plot_embedding_space(model: BooleanTransformer, save_path: Optional[str] = N
 
     ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} var)')
     ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} var)')
-    ax.set_title('Token Embedding Space (PCA)', fontsize=13, fontweight='bold')
+    tag = _tag(op_name, wd)
+    ax.set_title(f'Token Embedding Space (PCA): {tag}', fontsize=13, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
+        print(f"  Saved: {save_path}")
     plt.close()
+
+    return {
+        'pc1_variance': float(pca.explained_variance_ratio_[0]),
+        'pc2_variance': float(pca.explained_variance_ratio_[1]),
+        'coords': {
+            TOKEN_NAMES[i]: coords[i].tolist()
+            for i in range(min(len(TOKEN_NAMES), VOCAB_SIZE))
+        }
+    }
 
 
 # ─────────────────────────────────────────────────────────────────
 # 4. LOGIT LENS
 # ─────────────────────────────────────────────────────────────────
 
-def logit_lens(model: BooleanTransformer, op_name: str,
+def logit_lens(model: BooleanTransformer, op_name: str, wd: float,
                device: str = 'cpu', save_path: Optional[str] = None):
     op_token = OPERATIONS[op_name][0]
     inputs = [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -174,6 +201,7 @@ def logit_lens(model: BooleanTransformer, op_name: str,
     ln_final = model.ln_final
 
     fig, axes = plt.subplots(len(inputs), 1, figsize=(10, 3 * len(inputs)))
+    results = {}
 
     for inp_idx, (a, b) in enumerate(inputs):
         tokens = torch.tensor([[a, op_token, b, EQ_TOKEN]], dtype=torch.long).to(device)
@@ -194,6 +222,11 @@ def logit_lens(model: BooleanTransformer, op_name: str,
             probs = torch.softmax(logits, dim=0)
             prob_true.append(probs[TRUE_TOKEN].item())
 
+        results[f'{a}_{op_name}_{b}'] = {
+            'expected': bool(true_result),
+            'prob_true_per_stage': {s: float(p) for s, p in zip(stages, prob_true)}
+        }
+
         ax.bar(range(len(stages)), prob_true,
                color=['steelblue' if p < 0.5 else 'crimson' for p in prob_true])
         ax.axhline(0.5, color='gray', linestyle='--', alpha=0.7)
@@ -204,12 +237,15 @@ def logit_lens(model: BooleanTransformer, op_name: str,
         expected = 'T' if true_result else 'F'
         ax.set_title(f'Input: {a} {op_name} {b} = {expected}')
 
-    fig.suptitle(f'Logit Lens: {op_name}', fontsize=13, fontweight='bold')
+    tag = _tag(op_name, wd)
+    fig.suptitle(f'Logit Lens: {tag}', fontsize=13, fontweight='bold')
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
+        print(f"  Saved: {save_path}")
     plt.close()
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -233,10 +269,11 @@ def ablation_study(model: BooleanTransformer, op_name: str, device: str = 'cpu')
         return correct / total
 
     baseline = get_acc(model)
-    print(f"Baseline accuracy: {baseline:.4f}")
-    print(f"\nAblation results (zeroing out components):")
-    print(f"{'Component':<30} {'Accuracy':<12} {'Drop':<10} {'Load-bearing?'}")
-    print("-" * 65)
+    results = {'baseline': float(baseline), 'components': {}}
+
+    print(f"  Baseline: {baseline:.4f}")
+    print(f"  {'Component':<20} {'Acc':<10} {'Drop':<10} {'Load-bearing?'}")
+    print(f"  {'-' * 55}")
 
     for layer_idx, block in enumerate(model.blocks):
         for head_idx in range(model.cfg.n_heads):
@@ -245,8 +282,12 @@ def ablation_study(model: BooleanTransformer, op_name: str, device: str = 'cpu')
             acc = get_acc(model)
             drop = baseline - acc
             block.attn.W_O.data = orig_W_O
-            important = "✓ YES" if drop > 0.1 else "no"
-            print(f"  Layer {layer_idx} Head {head_idx}              {acc:.4f}       {drop:+.4f}     {important}")
+            important = drop > 0.1
+            key = f'L{layer_idx}H{head_idx}'
+            results['components'][key] = {
+                'accuracy': float(acc), 'drop': float(drop), 'load_bearing': important
+            }
+            print(f"  {key:<20} {acc:.4f}     {drop:+.4f}     {'✓ YES' if important else 'no'}")
 
         if block.mlp is not None:
             orig_W_out = block.mlp.W_out.data.clone()
@@ -254,17 +295,22 @@ def ablation_study(model: BooleanTransformer, op_name: str, device: str = 'cpu')
             acc = get_acc(model)
             drop = baseline - acc
             block.mlp.W_out.data = orig_W_out
-            important = "✓ YES" if drop > 0.1 else "no"
-            print(f"  Layer {layer_idx} MLP                    {acc:.4f}       {drop:+.4f}     {important}")
+            important = drop > 0.1
+            key = f'L{layer_idx}_MLP'
+            results['components'][key] = {
+                'accuracy': float(acc), 'drop': float(drop), 'load_bearing': important
+            }
+            print(f"  {key:<20} {acc:.4f}     {drop:+.4f}     {'✓ YES' if important else 'no'}")
 
-    return baseline
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────
 # 6. WEIGHT MATRIX STRUCTURE
 # ─────────────────────────────────────────────────────────────────
 
-def plot_weight_matrices(model: BooleanTransformer, save_path: Optional[str] = None):
+def plot_weight_matrices(model: BooleanTransformer, op_name: str, wd: float,
+                         save_path: Optional[str] = None):
     layer = model.blocks[0]
     matrices = {
         'W_E (Embedding)': model.W_E.weight.detach().cpu().numpy(),
@@ -274,107 +320,320 @@ def plot_weight_matrices(model: BooleanTransformer, save_path: Optional[str] = N
     }
 
     fig, axes = plt.subplots(1, len(matrices), figsize=(5 * len(matrices), 5))
+    stats = {}
 
     for ax, (name, mat) in zip(axes, matrices.items()):
         norm = TwoSlopeNorm(vmin=mat.min(), vcenter=0, vmax=mat.max())
         im = ax.imshow(mat, cmap='RdBu_r', norm=norm, aspect='auto')
         ax.set_title(name, fontsize=11, fontweight='bold')
         plt.colorbar(im, ax=ax, shrink=0.7)
+        stats[name] = {
+            'min': float(mat.min()),
+            'max': float(mat.max()),
+            'mean': float(mat.mean()),
+            'std': float(mat.std()),
+            'frobenius_norm': float(np.linalg.norm(mat)),
+            'sparsity_pct': float((np.abs(mat) < 0.01).mean()),
+        }
 
-    fig.suptitle('Weight Matrix Structure', fontsize=13, fontweight='bold')
+    tag = _tag(op_name, wd)
+    fig.suptitle(f'Weight Matrix Structure: {tag}', fontsize=13, fontweight='bold')
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
+        print(f"  Saved: {save_path}")
     plt.close()
 
+    return stats
+
 
 # ─────────────────────────────────────────────────────────────────
-# 7. MAIN ANALYSIS RUNNER
+# 7. HTML REPORT
 # ─────────────────────────────────────────────────────────────────
 
-def run_full_analysis(op_name: str, checkpoint_dir: str = 'checkpoints',
+def generate_html_report(
+    op_name: str, wd: float, cfg_dict: dict, history: dict,
+    embedding_stats: dict, weight_stats: dict,
+    ablation_results: dict, logit_results: dict,
+    plots_dir: Path, ops_to_analyze: list, save_path: str
+):
+    tag = _tag(op_name, wd)
+
+    def img_tag(path, caption=''):
+        if not Path(path).exists():
+            return f'<p style="color:red;font-size:12px">Missing: {path}</p>'
+        b64 = _img_to_base64(path)
+        return (
+            f'<figure style="margin:0 0 16px 0">'
+            f'<img src="data:image/png;base64,{b64}" '
+            f'style="width:100%;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.12)"/>'
+            f'<figcaption style="color:#666;font-size:12px;margin-top:4px">{caption}</figcaption>'
+            f'</figure>'
+        )
+
+    def kv_table(rows: dict):
+        rows_html = ''.join(
+            f'<tr><td style="padding:5px 12px;font-weight:500;color:#444">{k}</td>'
+            f'<td style="padding:5px 12px;font-family:monospace;color:#222">{v}</td></tr>'
+            for k, v in rows.items()
+        )
+        return (
+            f'<table style="border-collapse:collapse;width:100%;'
+            f'background:#f7f7f7;border-radius:6px;overflow:hidden;margin-bottom:16px">'
+            f'{rows_html}</table>'
+        )
+
+    # Config
+    config_rows = {
+        'Operation': op_name, 'Weight Decay': str(wd),
+        'Epochs': str(cfg_dict.get('n_epochs', '?')),
+        'd_model': str(cfg_dict.get('d_model', '?')),
+        'n_heads': str(cfg_dict.get('n_heads', '?')),
+        'n_layers': str(cfg_dict.get('n_layers', '?')),
+        'd_mlp': str(cfg_dict.get('d_mlp', '?')),
+        'Learning Rate': str(cfg_dict.get('lr', '?')),
+    }
+
+    # Training summary
+    training_rows = {
+        'Final Train Accuracy': f"{history['train_acc'][-1]:.4f}",
+        'Final Test Accuracy': f"{history['test_acc'][-1]:.4f}",
+        'Final Train Loss': f"{history['train_loss'][-1]:.6f}",
+        'Final Test Loss': f"{history['test_loss'][-1]:.6f}",
+        'Final Weight Norm': f"{history['weight_norm'][-1]:.4f}",
+        'Total Epochs': str(history['epoch'][-1]),
+    }
+
+    # Embedding stats
+    emb_rows = {
+        'PC1 Variance': f"{embedding_stats['pc1_variance']:.1%}",
+        'PC2 Variance': f"{embedding_stats['pc2_variance']:.1%}",
+    }
+    for tok, coord in embedding_stats['coords'].items():
+        emb_rows[f'{tok} (PC1, PC2)'] = f"({coord[0]:.4f}, {coord[1]:.4f})"
+
+    # Weight matrix stats
+    wm_html = ''
+    for mat_name, s in weight_stats.items():
+        wm_html += f'<h4 style="margin:12px 0 4px 0;color:#333">{mat_name}</h4>'
+        wm_html += kv_table({
+            'Min / Max': f"{s['min']:.6f} / {s['max']:.6f}",
+            'Mean / Std': f"{s['mean']:.6f} / {s['std']:.6f}",
+            'Frobenius Norm': f"{s['frobenius_norm']:.6f}",
+            'Sparsity (|w|<0.01)': f"{s['sparsity_pct']:.1%}",
+        })
+
+    # Per-operation sections
+    op_sections = ''
+    for op in ops_to_analyze:
+        abl = ablation_results.get(op, {})
+        log = logit_results.get(op, {})
+
+        if op_name == 'ALL':
+            attn_path = str(plots_dir / op / f'attention_patterns_{tag}_{op}.png')
+            logit_path = str(plots_dir / op / f'logit_lens_{tag}_{op}.png')
+        else:
+            attn_path = str(plots_dir / f'attention_patterns_{tag}_{op}.png')
+            logit_path = str(plots_dir / f'logit_lens_{tag}_{op}.png')
+
+        # Ablation table
+        abl_html = ''
+        if abl:
+            baseline = abl.get('baseline', 0)
+            abl_html += (
+                f'<p style="font-weight:bold;color:#333">Baseline Accuracy: {baseline:.4f}</p>'
+                f'<table style="border-collapse:collapse;width:100%;margin-bottom:12px">'
+                f'<tr style="background:#dde"><th style="padding:5px 10px">Component</th>'
+                f'<th>Accuracy</th><th>Drop</th><th>Load-bearing?</th></tr>'
+            )
+            for comp, vals in abl.get('components', {}).items():
+                bg = '#ffe8e8' if vals['load_bearing'] else '#f9f9f9'
+                flag = '✓ YES' if vals['load_bearing'] else 'no'
+                abl_html += (
+                    f'<tr style="background:{bg}">'
+                    f'<td style="padding:5px 10px;font-family:monospace">{comp}</td>'
+                    f'<td style="padding:5px 10px;font-family:monospace">{vals["accuracy"]:.4f}</td>'
+                    f'<td style="padding:5px 10px;font-family:monospace">{vals["drop"]:+.4f}</td>'
+                    f'<td style="padding:5px 10px">{flag}</td>'
+                    f'</tr>'
+                )
+            abl_html += '</table>'
+
+        # Logit lens table
+        log_html = ''
+        if log:
+            log_html += (
+                f'<table style="border-collapse:collapse;width:100%;margin-bottom:12px">'
+                f'<tr style="background:#dde"><th style="padding:5px 10px">Input</th>'
+                f'<th>Expected</th><th>Stage</th><th>P(True)</th><th>Correct?</th></tr>'
+            )
+            for inp_key, vals in log.items():
+                expected = 'T' if vals['expected'] else 'F'
+                for stage, p in vals['prob_true_per_stage'].items():
+                    correct = (p > 0.5) == vals['expected']
+                    bg = '#e8ffe8' if correct else '#ffe8e8'
+                    log_html += (
+                        f'<tr style="background:{bg}">'
+                        f'<td style="padding:4px 10px;font-family:monospace">{inp_key}</td>'
+                        f'<td style="padding:4px 10px">{expected}</td>'
+                        f'<td style="padding:4px 10px">{stage}</td>'
+                        f'<td style="padding:4px 10px;font-family:monospace">{p:.4f}</td>'
+                        f'<td style="padding:4px 10px">{"✓" if correct else "✗"}</td>'
+                        f'</tr>'
+                    )
+            log_html += '</table>'
+
+        op_sections += f'''
+        <div style="border:1px solid #ccc;border-radius:8px;padding:20px;margin-bottom:24px">
+            <h3 style="color:#2c5f8a;margin-top:0">Operation: {op}</h3>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+                <div>{img_tag(attn_path, f'Attention Patterns — {op}')}</div>
+                <div>{img_tag(logit_path, f'Logit Lens — {op}')}</div>
+            </div>
+            <h4 style="margin:0 0 8px 0">Ablation Study</h4>
+            {abl_html}
+            <h4 style="margin:0 0 8px 0">Logit Lens (Numerical)</h4>
+            {log_html}
+        </div>'''
+
+    training_path = str(plots_dir / f'training_curves_{tag}.png')
+    embed_path    = str(plots_dir / f'embeddings_{tag}.png')
+    wm_path       = str(plots_dir / f'weight_matrices_{tag}.png')
+
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Report: {tag}</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 1200px; margin: 0 auto; padding: 24px; color: #222; background: #fff;
+  }}
+  h1 {{ color: #1a3a5c; border-bottom: 3px solid #2c5f8a; padding-bottom: 8px; }}
+  h2 {{ color: #2c5f8a; border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-top: 32px; }}
+  .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+</style>
+</head>
+<body>
+
+<h1>Experiment Report: {tag}</h1>
+<p style="color:#888;font-size:13px">Auto-generated by interpret.py</p>
+
+<h2>1. Configuration</h2>
+<div class="grid2">
+  <div><h4>Model & Training Config</h4>{kv_table(config_rows)}</div>
+  <div><h4>Training Summary</h4>{kv_table(training_rows)}</div>
+</div>
+
+<h2>2. Training Dynamics</h2>
+{img_tag(training_path, 'Accuracy / Loss / Weight Norm over epochs')}
+
+<h2>3. Embedding Space</h2>
+<div class="grid2">
+  <div>{img_tag(embed_path, 'PCA of token embeddings')}</div>
+  <div><h4>Embedding Coordinates</h4>{kv_table(emb_rows)}</div>
+</div>
+
+<h2>4. Weight Matrices</h2>
+{img_tag(wm_path, 'W_E, W_Q, W_K, W_V heatmaps')}
+{wm_html}
+
+<h2>5. Per-Operation Analysis</h2>
+{op_sections}
+
+</body>
+</html>'''
+
+    with open(save_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    print(f"\n  ✓ HTML report: {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# 8. MAIN RUNNER
+# ─────────────────────────────────────────────────────────────────
+
+def run_full_analysis(op_name: str, wd: float = 1.0,
+                      checkpoint_dir: str = 'checkpoints',
                       device: str = 'cpu'):
-    """
-    Run all analyses on a trained model.
-    
-    If op_name is 'ALL', loads the ALL ops model and runs per-operation
-    analysis (attention, logit lens, ablation) for each operation separately.
-    Embedding and weight matrix plots are shared and saved once.
-    """
-    # Determine which operations to analyze
+    tag = _tag(op_name, wd)
     ops_to_analyze = list(OPERATIONS.keys()) if op_name == 'ALL' else [op_name]
 
-    save_dir = Path(checkpoint_dir) / op_name
+    save_dir  = Path(checkpoint_dir) / op_name
     plots_dir = save_dir / 'plots'
-    plots_dir.mkdir(exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load config and history
     with open(save_dir / 'config.json') as f:
         cfg_dict = json.load(f)
     with open(save_dir / 'history.json') as f:
         history = json.load(f)
 
-    # Rebuild model
     model_cfg = TransformerConfig(
-        vocab_size=VOCAB_SIZE,
-        seq_len=SEQ_LEN,
-        d_model=cfg_dict['d_model'],
-        n_heads=cfg_dict['n_heads'],
-        n_layers=cfg_dict['n_layers'],
-        d_mlp=cfg_dict['d_mlp'],
+        vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN,
+        d_model=cfg_dict['d_model'], n_heads=cfg_dict['n_heads'],
+        n_layers=cfg_dict['n_layers'], d_mlp=cfg_dict['d_mlp'],
         use_mlp=cfg_dict['use_mlp'],
     )
     model = BooleanTransformer(model_cfg).to(device)
     model.load_state_dict(torch.load(save_dir / 'final_model.pt', map_location=device))
     model.eval()
-    print(f"Loaded model for {op_name}")
+    print(f"Loaded model: {tag}\n")
 
-    # 1. Training curves — one plot for the whole model
-    print("\n[1/6] Plotting training curves...")
-    plot_training_curves(history, op_name,
-                         save_path=str(plots_dir / 'training_curves.png'))
+    print("[1/7] Training curves...")
+    plot_training_curves(history, op_name, wd,
+        save_path=str(plots_dir / f'training_curves_{tag}.png'))
 
-    # 2. Attention patterns — one plot per operation
-    print("\n[2/6] Plotting attention patterns...")
+    print("\n[2/7] Attention patterns...")
     for op in ops_to_analyze:
-        op_dir = plots_dir / op if op_name == 'ALL' else plots_dir
+        op_dir = (plots_dir / op) if op_name == 'ALL' else plots_dir
         op_dir.mkdir(exist_ok=True)
         print(f"  -> {op}")
-        plot_attention_patterns(model, op, device,
-                                save_path=str(op_dir / 'attention_patterns.png'))
+        plot_attention_patterns(model, op, wd, device,
+            save_path=str(op_dir / f'attention_patterns_{tag}_{op}.png'))
 
-    # 3. Embedding space — shared across all ops, saved once
-    print("\n[3/6] Plotting embedding space (shared)...")
-    plot_embedding_space(model, save_path=str(plots_dir / 'embeddings.png'))
+    print("\n[3/7] Embedding space...")
+    embedding_stats = plot_embedding_space(model, op_name, wd,
+        save_path=str(plots_dir / f'embeddings_{tag}.png'))
 
-    # 4. Logit lens — one plot per operation
-    print("\n[4/6] Running logit lens...")
+    print("\n[4/7] Logit lens...")
+    logit_results = {}
     for op in ops_to_analyze:
-        op_dir = plots_dir / op if op_name == 'ALL' else plots_dir
+        op_dir = (plots_dir / op) if op_name == 'ALL' else plots_dir
         op_dir.mkdir(exist_ok=True)
         print(f"  -> {op}")
-        logit_lens(model, op, device,
-                   save_path=str(op_dir / 'logit_lens.png'))
+        logit_results[op] = logit_lens(model, op, wd, device,
+            save_path=str(op_dir / f'logit_lens_{tag}_{op}.png'))
 
-    # 5. Ablation — one study per operation
-    print("\n[5/6] Running ablation study...")
+    print("\n[5/7] Ablation study...")
+    ablation_results = {}
     for op in ops_to_analyze:
-        print(f"\n  === Ablation for {op} ===")
-        ablation_study(model, op, device)
+        print(f"\n  === {op} ===")
+        ablation_results[op] = ablation_study(model, op, device)
 
-    # 6. Weight matrices — shared, saved once
-    print("\n[6/6] Plotting weight matrices...")
-    plot_weight_matrices(model, save_path=str(plots_dir / 'weight_matrices.png'))
+    print("\n[6/7] Weight matrices...")
+    weight_stats = plot_weight_matrices(model, op_name, wd,
+        save_path=str(plots_dir / f'weight_matrices_{tag}.png'))
 
-    print(f"\n✓ All plots saved to {plots_dir}")
+    print("\n[7/7] HTML report...")
+    generate_html_report(
+        op_name=op_name, wd=wd, cfg_dict=cfg_dict, history=history,
+        embedding_stats=embedding_stats, weight_stats=weight_stats,
+        ablation_results=ablation_results, logit_results=logit_results,
+        plots_dir=plots_dir, ops_to_analyze=ops_to_analyze,
+        save_path=str(save_dir / f'report_{tag}.html')
+    )
+
+    print(f"\n✓ All outputs saved to: {save_dir}")
     return model, history
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--op', type=str, default='XOR')
-    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
+    parser.add_argument('--op',             type=str,   default='XOR')
+    parser.add_argument('--wd',             type=float, default=1.0,
+                        help='Weight decay used during training (for file naming)')
+    parser.add_argument('--checkpoint_dir', type=str,   default='checkpoints')
     args = parser.parse_args()
-    run_full_analysis(args.op, args.checkpoint_dir)
+    run_full_analysis(args.op, args.wd, args.checkpoint_dir)
