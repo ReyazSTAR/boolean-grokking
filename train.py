@@ -14,6 +14,7 @@ import torch.optim as optim
 import numpy as np
 import os
 import json
+import random
 from dataclasses import dataclass, asdict
 from typing import Optional
 from pathlib import Path
@@ -24,7 +25,9 @@ from data.dataset import (
     VOCAB_SIZE, SEQ_LEN
 )
 
-
+torch.manual_seed(42)
+random.seed(42)
+np.random.seed(42)
 @dataclass
 class TrainConfig:
     # Model
