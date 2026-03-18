@@ -428,8 +428,7 @@ def neuron_analysis(model: BooleanTransformer, op_name: str, wd: float,
             break
 
     baseline_acc = get_acc(model)
-    print(f"
-  Neuron ablation baseline: {baseline_acc:.4f}")
+    print(f"\n  Neuron ablation baseline: {baseline_acc:.4f}")
     print(f"  {'Neuron':>8}  {'Acc':>8}  {'Drop':>8}  {'Load-bearing?'}")
     print(f"  {'-'*50}")
 
