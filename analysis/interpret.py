@@ -17,6 +17,7 @@ Usage:
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
@@ -368,19 +369,8 @@ def neuron_analysis(model: BooleanTransformer, op_name: str, wd: float,
     op_token = OPERATIONS[op_name][0]
     inputs   = [(0, 0), (0, 1), (1, 0), (1, 1)]
 
-    # ── Collect MLP hidden activations via hook ──────────────────
-    activation_store = {}
-
-    def mlp_hook(module, input, output):
-        activation_store['mlp_hidden'] = output.detach().cpu()
-
-    # Hook onto the first MLP's hidden linear (W_in output, before W_out)
-    hooks = []
-    for block in model.blocks:
-        if block.mlp is not None:
-            hooks.append(block.mlp.W_in.register_forward_hook(mlp_hook))
-            break  # only first layer
-
+    # ── Collect MLP hidden activations via pre_act cache ─────────
+    # MLP.forward() saves pre-activation (before GELU) in self.pre_act
     acts_per_input = []
     input_labels   = []
 
@@ -389,16 +379,14 @@ def neuron_analysis(model: BooleanTransformer, op_name: str, wd: float,
         for (a, b) in inputs:
             tokens = torch.tensor([[a, op_token, b, EQ_TOKEN]],
                                    dtype=torch.long).to(device)
-            activation_store.clear()
             model(tokens)
-            # shape: (1, seq_len, d_mlp) — take last position
-            act = activation_store['mlp_hidden'][0, -1, :].numpy()
+            # pre_act shape: (1, seq_len, d_mlp) — take last position, apply GELU
+            pre = model.blocks[0].mlp.pre_act[0, -1, :]
+            act = F.gelu(pre).cpu().numpy()
             acts_per_input.append(act)
             result = OPERATIONS[op_name][1](a, b)
-            input_labels.append(f'{a} {op_name} {b} = {int(result)}')
+            input_labels.append(f"{a} {op_name} {b} = {int(result)}")
 
-    for h in hooks:
-        h.remove()
 
     acts = np.stack(acts_per_input)   # (4, d_mlp)
     n_neurons  = acts.shape[1]
