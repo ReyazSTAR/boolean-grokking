@@ -348,13 +348,207 @@ def plot_weight_matrices(model: BooleanTransformer, op_name: str, wd: float,
 
 
 # ─────────────────────────────────────────────────────────────────
-# 7. HTML REPORT
+# 7. NEURON ANALYSIS
+# ─────────────────────────────────────────────────────────────────
+
+def neuron_analysis(model: BooleanTransformer, op_name: str, wd: float,
+                    device: str = 'cpu', save_dir: Optional[Path] = None,
+                    top_n: int = 10):
+    """
+    Neuron-level analysis of the MLP hidden layer.
+
+    For each input, records the activation of every neuron in the MLP
+    hidden layer (after the nonlinearity). Then:
+      - Ranks neurons by variance across inputs (high variance = more discriminative)
+      - Ablates each neuron one at a time and measures accuracy drop
+      - Saves a heatmap + bar chart and returns numerical results
+    """
+    from data.dataset import make_loaders
+
+    op_token = OPERATIONS[op_name][0]
+    inputs   = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+    # ── Collect MLP hidden activations via hook ──────────────────
+    activation_store = {}
+
+    def mlp_hook(module, input, output):
+        activation_store['mlp_hidden'] = output.detach().cpu()
+
+    # Hook onto the first MLP's hidden linear (W_in output, before W_out)
+    hooks = []
+    for block in model.blocks:
+        if block.mlp is not None:
+            hooks.append(block.mlp.W_in.register_forward_hook(mlp_hook))
+            break  # only first layer
+
+    acts_per_input = []
+    input_labels   = []
+
+    model.eval()
+    with torch.no_grad():
+        for (a, b) in inputs:
+            tokens = torch.tensor([[a, op_token, b, EQ_TOKEN]],
+                                   dtype=torch.long).to(device)
+            activation_store.clear()
+            model(tokens)
+            # shape: (1, seq_len, d_mlp) — take last position
+            act = activation_store['mlp_hidden'][0, -1, :].numpy()
+            acts_per_input.append(act)
+            result = OPERATIONS[op_name][1](a, b)
+            input_labels.append(f'{a} {op_name} {b} = {int(result)}')
+
+    for h in hooks:
+        h.remove()
+
+    acts = np.stack(acts_per_input)   # (4, d_mlp)
+    n_neurons  = acts.shape[1]
+    variance   = np.var(acts,       axis=0)
+    mean_abs   = np.mean(np.abs(acts), axis=0)
+    top_idx    = np.argsort(variance)[::-1][:top_n]
+
+    print(f"\n  Top {top_n} neurons by input-variance ({op_name}):")
+    print(f"  {'Neuron':>8}  {'Variance':>10}  {'Mean |act|':>12}")
+    neuron_stats = []
+    for idx in top_idx:
+        print(f"  Neuron {idx:>3}   {variance[idx]:>10.4f}   {mean_abs[idx]:>12.4f}")
+        neuron_stats.append({
+            'neuron': int(idx),
+            'variance': float(variance[idx]),
+            'mean_abs': float(mean_abs[idx]),
+        })
+
+    # ── Per-neuron ablation ──────────────────────────────────────
+    dataset     = SingleOpDataset(op_name, n_copies=100)
+    _, test_loader = make_loaders(dataset, train_frac=0.5)
+
+    def get_acc(m):
+        m.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for toks, labels in test_loader:
+                toks, labels = toks.to(device), labels.to(device)
+                out = m(toks)
+                correct += (out.argmax(-1) == labels).sum().item()
+                total   += len(labels)
+        return correct / total
+
+    # identify the MLP W_in layer
+    mlp_layer = None
+    for block in model.blocks:
+        if block.mlp is not None:
+            mlp_layer = block.mlp.W_in
+            break
+
+    baseline_acc = get_acc(model)
+    print(f"\n  Neuron ablation baseline: {baseline_acc:.4f}")
+    print(f"  {'Neuron':>8}  {'Acc':>8}  {'Drop':>8}  {'Load-bearing?'}")
+    print(f"  {'-'*50}")
+
+    ablation_drops = []
+    for neuron_idx in range(n_neurons):
+        orig_w = mlp_layer.weight.data[neuron_idx].clone()
+        orig_b = mlp_layer.bias.data[neuron_idx].clone() if mlp_layer.bias is not None else None
+
+        mlp_layer.weight.data[neuron_idx] = 0.0
+        if mlp_layer.bias is not None:
+            mlp_layer.bias.data[neuron_idx] = 0.0
+
+        acc  = get_acc(model)
+        drop = baseline_acc - acc
+
+        mlp_layer.weight.data[neuron_idx] = orig_w
+        if mlp_layer.bias is not None:
+            mlp_layer.bias.data[neuron_idx] = orig_b
+
+        ablation_drops.append({
+            'neuron': neuron_idx,
+            'accuracy': float(acc),
+            'drop': float(drop),
+            'load_bearing': drop > 0.05,
+        })
+
+        if drop > 0.05:
+            print(f"  Neuron {neuron_idx:>3}   {acc:>8.4f}  {drop:>8.4f}  ✓ YES")
+
+    load_bearing_neurons = [d for d in ablation_drops if d['load_bearing']]
+    print(f"\n  Load-bearing neurons: {len(load_bearing_neurons)} / {n_neurons}")
+
+    # ── Plots ────────────────────────────────────────────────────
+    tag = _tag(op_name, wd)
+    saved_paths = {}
+
+    if save_dir is not None:
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        # Heatmap: inputs × top neurons
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+        fig.suptitle(f'Neuron Analysis: {tag} / {op_name}', fontsize=13, fontweight='bold')
+
+        ax = axes[0]
+        im = ax.imshow(acts[:, top_idx], aspect='auto', cmap='RdBu_r')
+        ax.set_xticks(range(top_n))
+        ax.set_xticklabels([f'N{i}' for i in top_idx], rotation=45, fontsize=8)
+        ax.set_yticks(range(len(input_labels)))
+        ax.set_yticklabels(input_labels, fontsize=9)
+        ax.set_xlabel('Neuron (sorted by variance)')
+        ax.set_ylabel('Input')
+        ax.set_title(f'Top {top_n} neuron activations')
+        plt.colorbar(im, ax=ax)
+
+        ax = axes[1]
+        ax.bar(range(top_n), variance[top_idx], color='steelblue')
+        ax.set_xticks(range(top_n))
+        ax.set_xticklabels([f'N{i}' for i in top_idx], rotation=45, fontsize=8)
+        ax.set_xlabel('Neuron index')
+        ax.set_ylabel('Variance across inputs')
+        ax.set_title('Input variance (higher = more discriminative)')
+
+        plt.tight_layout()
+        heatmap_path = str(save_dir / f'neuron_heatmap_{tag}_{op_name}.png')
+        plt.savefig(heatmap_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        saved_paths['heatmap'] = heatmap_path
+        print(f"  Saved: {heatmap_path}")
+
+        # Bar chart: ablation drops for all neurons
+        neurons   = [d['neuron'] for d in ablation_drops]
+        drop_vals = [d['drop']   for d in ablation_drops]
+        colors    = ['crimson' if d > 0.05 else 'steelblue' for d in drop_vals]
+
+        fig, ax = plt.subplots(figsize=(max(8, n_neurons * 0.3), 4))
+        ax.bar(neurons, drop_vals, color=colors)
+        ax.axhline(0.05, linestyle='--', color='gray', alpha=0.7, label='5% threshold')
+        ax.set_xlabel('Neuron index')
+        ax.set_ylabel('Accuracy drop when ablated')
+        ax.set_title(f'Per-neuron ablation: {tag} / {op_name}')
+        ax.legend()
+        plt.tight_layout()
+        ablation_path = str(save_dir / f'neuron_ablation_{tag}_{op_name}.png')
+        plt.savefig(ablation_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        saved_paths['ablation'] = ablation_path
+        print(f"  Saved: {ablation_path}")
+
+    return {
+        'baseline_accuracy': float(baseline_acc),
+        'n_neurons': n_neurons,
+        'top_neurons_by_variance': neuron_stats,
+        'ablation_drops': ablation_drops,
+        'load_bearing_count': len(load_bearing_neurons),
+        'saved_paths': saved_paths,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# 8. HTML REPORT
 # ─────────────────────────────────────────────────────────────────
 
 def generate_html_report(
     op_name: str, wd: float, cfg_dict: dict, history: dict,
     embedding_stats: dict, weight_stats: dict,
     ablation_results: dict, logit_results: dict,
+    neuron_results: dict,
     plots_dir: Path, ops_to_analyze: list, save_path: str
 ):
     tag = _tag(op_name, wd)
@@ -483,6 +677,45 @@ def generate_html_report(
                     )
             log_html += '</table>'
 
+        # Neuron analysis section
+        nr = neuron_results.get(op, {})
+        neuron_html = ''
+        if nr:
+            heatmap_path  = nr.get('saved_paths', {}).get('heatmap', '')
+            ablation_path = nr.get('saved_paths', {}).get('ablation', '')
+            neuron_html += (
+                f'<p style="color:#333"><b>Total neurons:</b> {nr.get("n_neurons","?")} &nbsp;|&nbsp; '
+                f'<b>Load-bearing:</b> {nr.get("load_bearing_count","?")} &nbsp;|&nbsp; '
+                f'<b>Baseline acc:</b> {nr.get("baseline_accuracy", 0):.4f}</p>'
+            )
+            neuron_html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">'
+            neuron_html += f'<div>{img_tag(heatmap_path, "Top neuron activations heatmap")}</div>'
+            neuron_html += f'<div>{img_tag(ablation_path, "Per-neuron ablation drops")}</div>'
+            neuron_html += '</div>'
+
+            # Top neurons table
+            top_neurons = nr.get('top_neurons_by_variance', [])
+            if top_neurons:
+                neuron_html += (
+                    '<table style="border-collapse:collapse;width:100%;margin-top:8px">'
+                    '<tr style="background:#dde"><th style="padding:5px 10px">Neuron</th>'
+                    '<th>Variance</th><th>Mean |act|</th><th>Load-bearing?</th></tr>'
+                )
+                abl_by_neuron = {d['neuron']: d for d in nr.get('ablation_drops', [])}
+                for n in top_neurons:
+                    abl = abl_by_neuron.get(n['neuron'], {})
+                    lb  = abl.get('load_bearing', False)
+                    bg  = '#ffe8e8' if lb else '#f9f9f9'
+                    neuron_html += (
+                        f'<tr style="background:{bg}">'
+                        f'<td style="padding:5px 10px;font-family:monospace">N{n["neuron"]}</td>'
+                        f'<td style="padding:5px 10px;font-family:monospace">{n["variance"]:.4f}</td>'
+                        f'<td style="padding:5px 10px;font-family:monospace">{n["mean_abs"]:.4f}</td>'
+                        f'<td style="padding:5px 10px">{"✓ YES" if lb else "no"}</td>'
+                        f'</tr>'
+                    )
+                neuron_html += '</table>'
+
         op_sections += f'''
         <div style="border:1px solid #ccc;border-radius:8px;padding:20px;margin-bottom:24px">
             <h3 style="color:#2c5f8a;margin-top:0">Operation: {op}</h3>
@@ -494,6 +727,8 @@ def generate_html_report(
             {abl_html}
             <h4 style="margin:0 0 8px 0">Logit Lens (Numerical)</h4>
             {log_html}
+            <h4 style="margin:0 0 8px 0">Neuron Analysis</h4>
+            {neuron_html}
         </div>'''
 
     training_path = str(plots_dir / f'training_curves_{tag}.png')
@@ -611,15 +846,25 @@ def run_full_analysis(op_name: str, wd: float = 1.0,
         print(f"\n  === {op} ===")
         ablation_results[op] = ablation_study(model, op, device)
 
-    print("\n[6/7] Weight matrices...")
+    print("\n[6/8] Weight matrices...")
     weight_stats = plot_weight_matrices(model, op_name, wd,
         save_path=str(plots_dir / f'weight_matrices_{tag}.png'))
 
-    print("\n[7/7] HTML report...")
+    print("\n[7/8] Neuron analysis...")
+    neuron_results = {}
+    for op in ops_to_analyze:
+        op_dir = (plots_dir / op) if op_name == 'ALL' else plots_dir
+        op_dir.mkdir(exist_ok=True)
+        print(f"\n  === {op} ===")
+        neuron_results[op] = neuron_analysis(
+            model, op, wd, device, save_dir=op_dir)
+
+    print("\n[8/8] HTML report...")
     generate_html_report(
         op_name=op_name, wd=wd, cfg_dict=cfg_dict, history=history,
         embedding_stats=embedding_stats, weight_stats=weight_stats,
         ablation_results=ablation_results, logit_results=logit_results,
+        neuron_results=neuron_results,
         plots_dir=plots_dir, ops_to_analyze=ops_to_analyze,
         save_path=str(save_dir / f'report_{tag}.html')
     )
