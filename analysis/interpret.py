@@ -420,33 +420,33 @@ def neuron_analysis(model: BooleanTransformer, op_name: str, wd: float,
                 total   += len(labels)
         return correct / total
 
-    # identify the MLP W_in layer
-    mlp_layer = None
+    # identify W_in and b_in parameters directly
+    mlp = None
     for block in model.blocks:
         if block.mlp is not None:
-            mlp_layer = block.mlp.W_in
+            mlp = block.mlp
             break
 
     baseline_acc = get_acc(model)
-    print(f"\n  Neuron ablation baseline: {baseline_acc:.4f}")
+    print(f"
+  Neuron ablation baseline: {baseline_acc:.4f}")
     print(f"  {'Neuron':>8}  {'Acc':>8}  {'Drop':>8}  {'Load-bearing?'}")
     print(f"  {'-'*50}")
 
     ablation_drops = []
     for neuron_idx in range(n_neurons):
-        orig_w = mlp_layer.weight.data[neuron_idx].clone()
-        orig_b = mlp_layer.bias.data[neuron_idx].clone() if mlp_layer.bias is not None else None
+        # W_in shape: (d_model, d_mlp) — neuron is column neuron_idx
+        orig_w_col = mlp.W_in.data[:, neuron_idx].clone()
+        orig_b     = mlp.b_in.data[neuron_idx].clone()
 
-        mlp_layer.weight.data[neuron_idx] = 0.0
-        if mlp_layer.bias is not None:
-            mlp_layer.bias.data[neuron_idx] = 0.0
+        mlp.W_in.data[:, neuron_idx] = 0.0
+        mlp.b_in.data[neuron_idx]    = 0.0
 
         acc  = get_acc(model)
         drop = baseline_acc - acc
 
-        mlp_layer.weight.data[neuron_idx] = orig_w
-        if mlp_layer.bias is not None:
-            mlp_layer.bias.data[neuron_idx] = orig_b
+        mlp.W_in.data[:, neuron_idx] = orig_w_col
+        mlp.b_in.data[neuron_idx]    = orig_b
 
         ablation_drops.append({
             'neuron': neuron_idx,
